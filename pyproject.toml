@@ -1,0 +1,20 @@
+[project]
+name = "aixiaoliang-agent"
+version = "0.1.0"
+description = "A-share vertical agent based on smolagents"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "smolagents",
+    "pandas",
+    "matplotlib",
+    "rqdatac",
+    "akshare",
+    "python-dotenv",
+    "google-generativeai",
+    "gradio",
+    "tushare"
+]
+
+[tool.setuptools]
+packages = ["aixiaoliang_agent"]
