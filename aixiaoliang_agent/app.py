@@ -83,17 +83,71 @@ def predict(message, history, session_id):
     for buffer in agent.run(message, history=formatted_history, stream_mode="full", session_id=session_id):
         yield buffer
 
-with gr.Blocks() as demo:
+css = """
+/* Make the container fill the screen */
+.gradio-container {
+    height: 100vh !important;
+    display: flex !important;
+    flex-direction: column !important;
+}
+
+/* Ensure the ChatInterface expands within the container */
+#chat-interface {
+    flex-grow: 1 !important;
+}
+
+/* Fix for footer spacing */
+.footer {
+    display: none !important;
+}
+"""
+
+css = """
+/* Remove default Gradio padding and force full height */
+.gradio-container {
+    padding: 0 !important;
+    margin: 0 !important;
+    max-width: 100% !important;
+    height: calc(100vh - 10px) !important;
+}
+
+#root-container {
+    height: calc(100vh - 10px) !important;
+    margin: 0 !important;
+    padding: 10px !important; /* Visual breathing room */
+    box-sizing: border-box !important;
+    display: flex !important;
+    flex-direction: column !important;
+}
+
+/* Ensure ChatInterface takes all remaining space */
+#root-container > div {
+    flex-grow: 1 !important;
+    display: flex !important;
+    flex-direction: column !important;
+}
+
+.chatbot {
+    flex-grow: 1 !important;
+}
+
+/* Hide footer to prevent spillover */
+footer {
+    display: none !important;
+}
+"""
+
+with gr.Blocks(fill_height=True) as demo:
     session_state = gr.State(generate_session_id)
     
-    chatbot = gr.ChatInterface(
-        fn=predict,
-        additional_inputs=[session_state],
-        title="AiXiaoliang 2.0 (A-Share Agent)",
-        description="Ask me about A-share stocks. I can search codes, check prices, and analyze fundamentals.",
-        # examples removed to avoid 'list of lists' error with additional_inputs
-        fill_height=True,
-    )
+    with gr.Column(elem_id="root-container"):
+        chatbot = gr.ChatInterface(
+            fn=predict,
+            additional_inputs=[session_state],
+            title="AiXiaoliang 2.0 (A-Share Agent)",
+            description="Ask me about A-share stocks. I can search codes, check prices, and analyze fundamentals.",
+            fill_height=True,
+        )
 
 
 if __name__ == "__main__":
@@ -111,7 +165,8 @@ if __name__ == "__main__":
         demo.launch(
             server_name="127.0.0.1", 
             server_port=port, 
-            share=False
+            share=False,
+            css=css
         )
     except Exception as e:
         import traceback

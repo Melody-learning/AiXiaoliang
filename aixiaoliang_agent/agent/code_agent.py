@@ -224,6 +224,8 @@ else:
 
     def run(self, user_input: str, history: List[str] = [], stream_mode: str = "delta", session_id: str = None, log_subdir: str = ""):
         full_buffer = ""
+        trace_md = "" # Aggregates all reasoning steps
+        final_answer = ""
         
         def yield_content(chunk, replace=False):
             nonlocal full_buffer
@@ -233,7 +235,15 @@ else:
                 full_buffer += chunk
             return full_buffer if stream_mode == "full" else chunk
 
-        # Reset Memory for this run (but keep 'history' passed from outside)
+        def render_display(is_final=False):
+            """Helper to render the current trace + final answer"""
+            status_attr = "" if is_final else "open"
+            accordion = f"<details {status_attr}>\n<summary>💡 思考过程 (点击展开)</summary>\n\n{trace_md}\n</details>"
+            if is_final:
+                return f"{accordion}\n\n{final_answer}"
+            return accordion
+
+        # Reset Memory for this run
         self.memory = [TaskStep(user_input)]
         
         # Session Logging Setup
@@ -246,29 +256,18 @@ else:
             
         log_file = os.path.join(log_dir, f"{session_id}.jsonl")
         
-        # Prepare Log Entry for THIS turn
         log_entry = {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "query": user_input,
             "steps": []
         }
-        
-        # Append initial entry to file (Start of Turn)
-        # We will update this entry or append steps? 
-        # Better: Append a specialized "Turn Start" line, then append steps as they happen?
-        # User requested "One Log File" for the session.
-        # Simplest valid JSONL: Each line is a complete Turn Object.
-        # But we want to log *steps* as they happen?
-        # Writing the whole Turn Object at the END is safer for valid JSONL.
             
         start_time = time.time()
-        
-        # ReAct Loop
         step_count = 0
         final_success = False
         
-        yield yield_content(f"Thinking about '{user_input}'... (Attempt 1)\n")
-
+        trace_md += f"Thinking about '{user_input}'... (Attempt 1)\n"
+        yield yield_content(render_display(), replace=True)
 
         try:
             while step_count < self.max_steps:
@@ -277,7 +276,7 @@ else:
                     
                     # Call LLM
                     llm_start = time.time()
-                    # Restore System Proxy (Counter Tushare Pollution)
+                    # Restore System Proxy
                     if self.sys_http_proxy:
                         os.environ["HTTP_PROXY"] = self.sys_http_proxy
                     else:
@@ -288,116 +287,97 @@ else:
                     else:
                         os.environ.pop("HTTPS_PROXY", None)
 
-                    if self.sys_https_proxy:
-                        os.environ["HTTPS_PROXY"] = self.sys_https_proxy
-                    else:
-                        os.environ.pop("HTTPS_PROXY", None)
-
                     model = genai.GenerativeModel(self.model_name)
-                    # Safety settings omitted for brevity/compatibility
                     response = model.generate_content(prompt)
                     llm_latency = time.time() - llm_start
                     
                     if not response.parts:
                         err = "[!] Empty Response from Model."
-                        print(f"DEBUG: Empty Response. Prompt Feedback: {response.prompt_feedback if hasattr(response, 'prompt_feedback') else 'Unknown'}")
-                        yield yield_content(f"{err}\n")
-                        break # Stop if model broken
+                        trace_md += f"\n{err}\n"
+                        yield yield_content(render_display(), replace=True)
+                        break
                         
                     content = response.text
                     self.memory.append(ThoughtStep(content))
-                    
-                    # Log Thought
                     log_entry["steps"].append({"type": "thought", "content": content, "latency": llm_latency, "attempt": step_count+1})
-                    
-                    # Display Thought
-                    attempt_label = f"Step {step_count+1}"
-                    yield yield_content(f"\n--- {attempt_label} ---\n")
-                    
-                    thought_block = f"""
-<details open>
-<summary>🧠 Brain Trace ({attempt_label})</summary>
-{content}
-</details>
-"""
-                    yield yield_content(thought_block)
                     
                     # Extract Code
                     code_match = re.search(r"```python\n(.*?)```", content, re.DOTALL)
                     
                     if code_match:
+                        # If it has code, it's a reasoning step, add to trace
+                        attempt_label = f"Step {step_count+1}"
+                        trace_md += f"\n#### 🧠 {attempt_label}\n{content}\n"
+                        trace_md += f"\n> 🏃 正在执行代码...\n"
+                        yield yield_content(render_display(), replace=True)
+                        
                         code = code_match.group(1)
                         self.memory.append(CodeStep(code))
                         log_entry["steps"].append({"type": "code", "content": code})
-                        
-                        yield yield_content(f"\nrunning code ({attempt_label})... 🏃")
                         
                         # Execute Code
                         exec_start = time.time()
                         execution_result = ""
                         execution_error = None
                         
-                        # Generator-based code execution handling
                         exec_gen = self._execute_code_generator(code)
                         
                         try:
                             for chunk in exec_gen:
-                                # We might get strings (stdout) or Exceptions
                                 if isinstance(chunk, Exception):
                                     execution_error = chunk
                                 else:
                                     execution_result += chunk
-                                    yield yield_content(f"\n{chunk}")
+                                    trace_md += chunk
+                                    yield yield_content(render_display(), replace=True)
                         except Exception as e:
                             execution_error = e
 
                         exec_latency = time.time() - exec_start
                         
-                        # Store Observation or Error
                         if execution_error:
                             error_msg = str(execution_error)
                             self.memory.append(ErrorStep(error_msg))
                             log_entry["steps"].append({"type": "error", "content": error_msg, "latency": exec_latency})
-                            
-                            yield yield_content(f"\n⚠️ Execution Error in {attempt_label}: {error_msg}\nTrying to fix...\n")
-                            # Loop continues -> Next step will see ErrorStep
-                            
+                            trace_md += f"\n⚠️ 执行错误: {error_msg}\n正在尝试修复...\n"
+                            yield yield_content(render_display(), replace=True)
                         else:
-                            # Success Logic
                             self.memory.append(ObservationStep(execution_result))
                             log_entry["steps"].append({"type": "execution_trace", "content": execution_result, "latency": exec_latency})
                             
-                            # --- MIDDLEWARE: Observation Enrichment ---
                             if self._is_suspicious_output(execution_result):
-                                warning_msg = "System Warning: Output contains 'None' or appears invalid. Please verify the data keys and try again."
-                                # Inject warning into memory for next turn
+                                warning_msg = "System Warning: Output appears invalid. Self-Correction Triggered."
                                 self.memory.append(ObservationStep(warning_msg))
-                                # Yield warning to UI
-                                yield yield_content(f"\n⚠️ {warning_msg} (Self-Correction Triggered)\n")
+                                trace_md += f"\n⚠️ {warning_msg}\n"
+                                yield yield_content(render_display(), replace=True)
                             else:
                                 total_duration = time.time() - start_time
-                                summary = f"\n*(Success in {total_duration:.2f}s)*"
-                                yield yield_content(summary)
-                                
-                            # CRITICAL: DO NOT BREAK HERE.
-                            # The loop continues to let the Agent decide the next step based on the Observation.
-                            pass
+                                trace_md += f"\n*(Step success in {total_duration:.2f}s)*\n"
+                                yield yield_content(render_display(), replace=True)
                     
                     else:
-                        # No code generated -> Pure Chat Response?
-                        # In ReAct, if no action is taken, it's usually the Final Answer.
-                        yield yield_content(f"\n(No code action. Assuming Final Answer.)\n")
+                        # Final Answer Found (No code block)
+                        # Clean up "Thought: " or "Final Answer: " prefixes
+                        cleaned_answer = re.sub(r"^(Thought|Final Answer|总结|回答):\s*", "", content, flags=re.IGNORECASE | re.MULTILINE).strip()
+                        final_answer = cleaned_answer
+                        
+                        # Add a final label to trace for completion
+                        trace_md += f"\n#### ✅ 任务完成\n{content}\n"
                         final_success = True
                         break
                         
                 except Exception as e:
-                    yield yield_content(f"\n[!] System Error: {e}\n")
+                    trace_md += f"\n[!] System Error: {e}\n"
+                    yield yield_content(render_display(), replace=True)
                     break
                     
                 step_count += 1
 
             if not final_success and step_count == self.max_steps:
-                 yield yield_content(f"\n[!] Failed to solve task after {self.max_steps} attempts or reached explicit Max Steps.\n")
+                 trace_md += f"\n[!] Failed to solve task after {self.max_steps} attempts.\n"
+            
+            # Final Yield: Collapsed
+            yield yield_content(render_display(is_final=True), replace=True)
 
         finally:
             # Save Log (This will now run even if GeneratorExit is triggered)
