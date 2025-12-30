@@ -40,3 +40,23 @@ else:
     print("FAILURE: Agent did not find price. Check Trace.")
 
 print(full_response_2)
+
+# Step 3: PE Ratio (The Failure Case)
+history.append(f"User: {q2}")
+history.append(f"Assistant: {full_response_2}")
+
+q3 = "它的PE呢"
+print(f"\nUser: {q3}")
+print("Agent thinking (with history)...")
+
+full_response_3 = ""
+for chunk in agent.run(q3, history=history, stream_mode="full"):
+    full_response_3 = chunk
+
+print("\n--- Final Answer for 'Its PE' ---")
+if "None" not in full_response_3 and ("PE" in full_response_3 or "市盈率" in full_response_3):
+    print("SUCCESS: PE ratio found!")
+else:
+    print("FAILURE: PE ratio is None or missing.")
+
+print(full_response_3)

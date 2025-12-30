@@ -1,0 +1,32 @@
+# Environment variables
+.env
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python build/cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+.pytest_cache/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Logs
+logs/
+*.jsonl
+
+# Temporary/Large Files
+test_results_log.txt
+*.log
+
+# Other
+.DS_Store
+aixiaoliang_agent_v1_backup/

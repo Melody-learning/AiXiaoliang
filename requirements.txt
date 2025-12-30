@@ -1,0 +1,7 @@
+pandas
+tushare
+gradio
+python-dotenv
+google-generativeai
+matplotlib
+pyinstaller

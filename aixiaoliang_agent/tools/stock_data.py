@@ -1,8 +1,10 @@
 import os
 import tushare as ts
 import pandas as pd
+import time
 from dotenv import load_dotenv
 from .registry import register_tool
+from .data_utils import normalize_stock_records, create_envelope
 
 load_dotenv()
 
@@ -10,6 +12,11 @@ _PRO = None
 _IS_INIT = False
 
 def ensure_tushare_init():
+    # Always enforce Tushare Proxy (Ping-Pong Strategy with Gemini)
+    ts_proxy = os.getenv("TUSHARE_PROXY", "http://tushare.xyz:5000")
+    if ts_proxy and ts_proxy.lower() != "none":
+         os.environ["HTTP_PROXY"] = ts_proxy
+         
     global _PRO, _IS_INIT
     if _IS_INIT:
         return _PRO
@@ -20,9 +27,6 @@ def ensure_tushare_init():
         return None
 
     try:
-        # Set proxy for Tushare (Note: This specific token requires this internal proxy tunnel)
-        os.environ["HTTP_PROXY"] = "http://tushare.xyz:5000"
-        
         # Init Pro API
         _PRO = ts.pro_api(token)
         _IS_INIT = True
@@ -32,95 +36,84 @@ def ensure_tushare_init():
         print(f"[!] Tushare initialization failed: {e}")
         return None
 
-@register_tool(description="Search for a stock code by name. Example: '平安' -> '000001.SZ'. Returns List[Dict].")
+@register_tool(description="Search for a stock code by name. Example: '平安' -> '000001.SZ'. Returns Envelope.")
 def search_stock(keyword: str):
     """
     Search for stock code (ts_code) by display name.
     """
     pro = ensure_tushare_init()
     if not pro:
-        print("[!] Tushare not initialized.")
-        return []
+        return create_envelope(None, status="error", error="Tushare not initialized")
     
     try:
-        # Tushare doesn't have a fuzzy search API like RQ, so we fetch basic list and filter locally
-        # Cache this if possible in production
         df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name,industry')
-        
-        # Filter by name (contains)
         matches = df[df['name'].str.contains(keyword, case=False, na=False) | 
                      df['ts_code'].str.contains(keyword, case=False, na=False)]
         
         if matches.empty:
-            return []
+            return create_envelope([], status="empty", meta={"hint": f"No stock found matching '{keyword}'. Try a different keyword."})
             
-        # Return top 5 matches
-        # Normalize keys: ts_code -> code, industry -> sector
         records = []
         for _, row in matches.head(5).iterrows():
             records.append({
-                "code": row['ts_code'],
-                "stock_code": row['ts_code'],
+                "ts_code": row['ts_code'],
                 "name": row['name'],
                 "industry": row['industry']
             })
-        return records
+        data = normalize_stock_records(records)
+        return create_envelope(data, status="success")
     except Exception as e:
-        print(f"[!] Error searching stock: {e}")
-        return []
+        return create_envelope(None, status="error", error=f"Search failed: {e}")
 
-@register_tool(description="Get the current price (or latest close) of a stock.")
+@register_tool(description="Get the current price (or latest close) of a stock. Returns Envelope.")
 def get_current_price(stock_code: str):
     """
-    Returns the latest daily close price. Tushare basic interface is usually EOD.
+    Returns the latest daily close price.
     """
     pro = ensure_tushare_init()
     if not pro:
-        return "Error: Tushare not initialized."
+        return create_envelope(None, status="error", error="Tushare not initialized")
     
     try:
-        # Get daily data for the symbol
-        # stock_code format usually 000001.SZ or 600000.SH
         df = pro.daily(ts_code=stock_code, limit=1)
         if df.empty:
-             return f"No price data found for {stock_code}."
+             return create_envelope(None, status="empty", meta={"hint": f"No price data for {stock_code}. Check if code is correct."})
         
-        # Return the close price
-        # columns: ts_code, trade_date, open, high, low, close, pre_close, change, pct_chg, vol, amount
         data = df.iloc[0]
-        return f"{data['close']} (Date: {data['trade_date']})"
+        # Return simple string as data? Or dict? Best to return structured data inside envelope.
+        # But text description in prompt says "returns latest daily close price" which implies value.
+        # Let's return text as data to minimize breaking change, or better, return a DICT.
+        # Let's return a string for now as the prompt might expect printed text.
+        # Actually returning a dict is better for future tools.
+        # Reverting to string to be safe with existing agent expectations if they print it directly, 
+        # BUT the envelope wrapper is a dict anyway. The AGENT CODE accesses `res['data']`.
+        payload = f"{data['close']} (Date: {data['trade_date']})"
+        return create_envelope(payload, status="success")
     except Exception as e:
-        return f"Error fetching price: {e}"
+        return create_envelope(None, status="error", error=f"Fetch price failed: {e}")
 
-@register_tool(description="Get fundamental data (PE, PB, Market Cap, Revenue, etc.) for a stock. Returns Dict.")
+@register_tool(description="Get fundamental data (PE, PB, Market Cap, Revenue, etc.). Returns Envelope.")
 def get_fundamentals_data(stock_code: str):
     """
     Returns key financial indicators (daily basic) and income data.
     """
     pro = ensure_tushare_init()
     if not pro:
-        return "Error: Tushare not initialized."
+        return create_envelope(None, status="error", error="Tushare not initialized")
 
     try:
-        # 1. Daily Basic (PE, PB, Market Cap)
-        df_daily = pro.daily_basic(ts_code=stock_code, limit=1, fields='ts_code,trade_date,pe,pe_ttm,pb,total_mv')
-        
-        # 2. Income Statement (Revenue, Net Profit) - usually quarterly, taking latest
+        df_daily = pro.daily_basic(ts_code=stock_code, limit=1, fields='ts_code,trade_date,pe,pe_ttm,pb,total_mv,dv_ratio,dv_ttm')
         df_income = pro.income(ts_code=stock_code, limit=1, fields='total_revenue,n_income_attr_p')
         
         result = {}
-        
         if not df_daily.empty:
             d = df_daily.iloc[0]
-            # Primary Keys
-            result['pe_ratio'] = d['pe']
-            result['pe_ratio_ttm'] = d['pe_ttm']
-            result['pb_ratio'] = d['pb']
-            result['market_cap'] = d['total_mv']
-            
-            # Aliases for robustness (Agent often guesses 'pe' or 'pb')
             result['pe'] = d['pe']
+            result['pe_ttm'] = d['pe_ttm']
             result['pb'] = d['pb']
+            result['dv_ratio'] = d['dv_ratio']
+            result['dv_ttm'] = d['dv_ttm']
+            result['total_mv'] = d['total_mv']
         
         if not df_income.empty:
             inc = df_income.iloc[0]
@@ -128,46 +121,40 @@ def get_fundamentals_data(stock_code: str):
             result['net_profit'] = inc['n_income_attr_p']
             
         if not result:
-            return {}
+            return create_envelope({}, status="empty", meta={"hint": "No fundamentals data found. Stock might be delisted or new."})
             
-        return result
+        return create_envelope(result, status="success")
     except Exception as e:
-        return f"Error fetching fundamentals: {e}"
+        return create_envelope(None, status="error", error=f"Fetch fundamentals failed: {e}")
 
-@register_tool(description="Get list of stocks in a specific industry. Example: '银行' or '医药'. Returns List[Dict]. Keys: 'code', 'name', 'industry'.")
+@register_tool(description="Get list of stocks in a specific industry. Returns Envelope.")
 def get_industry_stocks(industry_name: str):
     """
     Search for stocks belonging to a specific industry.
-    Returns: List of dicts, e.g. [{'code': '000001.SZ', 'name': 'PingAn', 'industry': 'Bank'}]
     """
     pro = ensure_tushare_init()
     if not pro:
-        return "Error: Tushare not initialized."
+        return create_envelope(None, status="error", error="Tushare not initialized")
     
     try:
-        # Fetch all stocks and filter by industry
         df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name,industry')
-        
         matches = df[df['industry'].str.contains(industry_name, case=False, na=False)]
         
         if matches.empty:
-            return []
+            return create_envelope([], status="empty", meta={"hint": f"No stocks found for industry '{industry_name}'. Check industry name."})
             
-        # Return top 20
-        # Provide BOTH 'code' and 'stock_code' to be robust against Agent hallucinations
         records = []
         for _, row in matches.head(20).iterrows():
             records.append({
-                "code": row['ts_code'],       # For agents using 'code'
-                "stock_code": row['ts_code'], # For agents using 'stock_code'
+                "ts_code": row['ts_code'],
                 "name": row['name'],
                 "industry": row['industry']
             })
-        return records
+        return create_envelope(normalize_stock_records(records), status="success")
     except Exception as e:
-        return f"Error fetching industry stocks: {e}"
+        return create_envelope(None, status="error", error=f"Fetch industry failed: {e}")
 
-@register_tool(description="Get historical daily price data for a stock. Returns List[Dict].")
+@register_tool(description="Get historical daily price data. Returns Envelope.")
 def get_history_data(stock_code: str, start_date: str, end_date: str):
     """
     Get daily Open/High/Low/Close/Vol data. 
@@ -175,46 +162,37 @@ def get_history_data(stock_code: str, start_date: str, end_date: str):
     """
     pro = ensure_tushare_init()
     if not pro:
-        return "Error: Tushare not initialized."
+        return create_envelope(None, status="error", error="Tushare not initialized")
     
     try:
-        # Normalize date format (remove dashes if present)
         start_date = start_date.replace('-', '')
         end_date = end_date.replace('-', '')
         
-        # Tushare daily: ts_code, trade_date, open, high, low, close, vol
         df = pro.daily(ts_code=stock_code, start_date=start_date, end_date=end_date)
         
         if df.empty:
-            return []
+            return create_envelope([], status="empty", meta={"hint": f"No data between {start_date} and {end_date}."})
             
-        # Sort by date ascending
         df = df.sort_values('trade_date')
-        
         records = df[['ts_code', 'trade_date', 'close', 'open', 'high', 'low', 'vol', 'pct_chg']].to_dict(orient='records')
-        return records
+        return create_envelope(normalize_stock_records(records), status="success")
     except Exception as e:
-        return f"Error fetching history: {e}"
+        return create_envelope(None, status="error", error=f"Fetch history failed: {e}")
 
-@register_tool(description="Plot stock price history and save to file. Returns the file path of the plot.")
+@register_tool(description="Plot stock price history. Returns Envelope.")
 def plot_price_history(stock_code: str, start_date: str, end_date: str):
     """
-    Generates a line chart of the stock's close price and saves it as a .png file.
+    Generates a line chart and returns file path.
     """
     import matplotlib.pyplot as plt
-    import pandas as pd
-    
-    # Reuse get_history_data logic or call it directly? 
-    # Calling internal tools is cleaner but self.tools usage inside function is tricky without context.
-    # Better to just use the Tushare API directly here for self-containment.
     pro = ensure_tushare_init()
     if not pro:
-        return "Error: Tushare not initialized."
+        return create_envelope(None, status="error", error="Tushare not initialized")
     
     try:
         df = pro.daily(ts_code=stock_code, start_date=start_date, end_date=end_date)
         if df.empty:
-            return f"No data to plot for {stock_code}."
+            return create_envelope(None, status="empty", meta={"hint": "No data to plot."})
             
         df = df.sort_values('trade_date')
         df['trade_date'] = pd.to_datetime(df['trade_date'])
@@ -227,13 +205,151 @@ def plot_price_history(stock_code: str, start_date: str, end_date: str):
         plt.grid(True)
         plt.legend()
         
-        # Save to static dir or temp? 
-        # For Gradio, saving to a local path is fine.
         filename = f"plot_{stock_code.replace('.','_')}_{start_date}_{end_date}.png"
         filepath = os.path.abspath(filename)
         plt.savefig(filepath)
         plt.close()
         
-        return filepath
+        return create_envelope(filepath, status="success")
     except Exception as e:
-        return f"Error plotting: {e}"
+        return create_envelope(None, status="error", error=f"Plotting failed: {e}")
+
+@register_tool(description="获取市场概念列表。src='ts'为Tushare概念，'ths'为同花顺概念。Returns Envelope.")
+def get_concepts(src: str = 'ts'):
+    """
+    Get list of concepts/industries.
+    """
+    try:
+        pro = ensure_tushare_init()
+        if src == 'ts':
+            df = pro.concept()
+            records = df[['code', 'name', 'src']].to_dict(orient='records')
+        elif src == 'ths':
+            df = pro.ths_index()
+            records = df[['ts_code', 'name', 'count', 'exchange', 'list_date', 'type']].to_dict(orient='records')
+        else:
+            return create_envelope(None, status="error", error="src must be 'ts' or 'ths'")
+            
+        return create_envelope(records, status="success")
+    except Exception as e:
+        return create_envelope(None, status="error", error=f"Fetch concepts failed: {e}")
+
+@register_tool(description="获取特定概念下的股票列表。id为概念代码。Returns Envelope.")
+def get_concept_stocks(id: str):
+    """
+    Get stocks belonging to a specific concept.
+    """
+    try:
+        pro = ensure_tushare_init()
+        try:
+           df = pro.concept_detail(id=id)
+        except:
+           df = pro.ths_member(ts_code=id)
+           
+        if df.empty:
+             return create_envelope([], status="empty", meta={"hint": f"No stocks found for concept {id}."})
+             
+        if 'ts_code' not in df.columns and 'code' in df.columns:
+             df['ts_code'] = df['code']
+             
+        records = df[['ts_code', 'name']].head(100).to_dict(orient='records')
+        return create_envelope(normalize_stock_records(records), status="success")
+    except Exception as e:
+        return create_envelope(None, status="error", error=f"Fetch concept stocks failed: {e}")
+
+@register_tool(description="《Market Screener Tool》Get daily market snapshot for ALL stocks. date: YYYYMMDD. Returns Envelope.")
+def get_market_daily(trade_date: str):
+    """
+    Get daily quotes for ALL stocks on a specific date. 
+    """
+    try:
+        pro = ensure_tushare_init()
+        df = pro.daily(trade_date=trade_date)
+        
+        if df.empty:
+            return create_envelope([], status="empty", meta={"hint": "No market data found for this date. It might be a holiday or data is not yet available."})
+        
+        fields = ['ts_code', 'trade_date', 'close', 'open', 'high', 'low', 'pct_chg', 'vol', 'amount']
+        df = df[fields]
+        records = df.to_dict(orient='records')
+        return create_envelope(normalize_stock_records(records), status="success")
+    except Exception as e:
+        return create_envelope(None, status="error", error=f"Fetch market daily failed: {e}")
+
+@register_tool(description="《Market Screener Tool》Get daily basic indicators (PE, PB, Turnover, Dividend, Market Cap) for ALL stocks. date: YYYYMMDD. Returns Envelope.")
+def get_daily_basic(trade_date: str):
+    """
+    Get fundamental indicators for ALL stocks on a specific date.
+    Essential for screening stocks by PE, PB, Dividend Yield, Market Cap, Revenue (TTM), and Net Profit (TTM).
+    Note: 'total_revenue_ttm' and 'net_profit_ttm' are derived from MV/PS and MV/PE ratios.
+    """
+    try:
+        pro = ensure_tushare_init()
+        # Fetch daily basic data
+        # Fields: ts_code, trade_date, close, turnover_rate, volume_ratio, pe, pe_ttm, pb, ps, ps_ttm, dv_ratio, dv_ttm, total_share, float_share, free_share, total_mv, circ_mv
+        fields = 'ts_code,trade_date,close,turnover_rate,volume_ratio,pe,pe_ttm,pb,ps,ps_ttm,dv_ratio,dv_ttm,total_share,float_share,free_share,total_mv,circ_mv'
+        df = pro.daily_basic(trade_date=trade_date, fields=fields)
+        
+        if df.empty:
+            return create_envelope([], status="empty", meta={"hint": "No basic data found for this date. Check if it is a trading day or holiday."})
+        
+        # Calculate derived fields (Revenue TTM, Net Profit TTM)
+        # total_mv is in 10k (万元), convert to Yuan.
+        df['total_revenue_ttm'] = df.apply(lambda row: (row['total_mv'] * 10000) / row['ps_ttm'] if row['ps_ttm'] else None, axis=1)
+        df['net_profit_ttm'] = df.apply(lambda row: (row['total_mv'] * 10000) / row['pe_ttm'] if row['pe_ttm'] else None, axis=1)
+        
+        records = df.to_dict(orient='records')
+        return create_envelope(normalize_stock_records(records), status="success")
+    except Exception as e:
+        return create_envelope(None, status="error", error=f"Fetch daily basic failed: {e}")
+
+@register_tool(description="《Market Screener Tool》Get financial ratios (ROE, Margins) for ALL stocks. period: YYYYMMDD (Quarter End). Returns Envelope.")
+def get_financial_indicator(period: str):
+    """
+    Get financial ratios (ROE, Gross Margin, Net Margin, etc.) for ALL stocks for a specific reporting period.
+    Use Quarter End dates: e.g. '20241231', '20250331', '20250630'.
+    Note: Iterates through all stocks in chunks, which may take ~10-20 seconds.
+    """
+    try:
+        pro = ensure_tushare_init()
+        # 1. Get all stock codes
+        basics = pro.stock_basic(exchange='', list_status='L', fields='ts_code')
+        if basics.empty:
+            return create_envelope(None, status="error", error="Failed to fetch stock list.")
+        
+        all_codes = basics['ts_code'].tolist()
+        
+        # 2. Define fields
+        fields = 'ts_code,end_date,roe,roe_dt,gross_margin,netprofit_margin,dt_eps'
+        
+        # 3. Chunk and fetch
+        results = []
+        chunk_size = 50 
+        # Note: Depending on permission, 50-100 is safe.
+        
+        # Helper logging
+        print(f"[*] Batch fetching financials for period {period} ({len(all_codes)} stocks)...")
+        
+        for i in range(0, len(all_codes), chunk_size):
+            chunk = all_codes[i:i+chunk_size]
+            codes_str = ",".join(chunk)
+
+            try:
+                # Tushare call
+                df_chunk = pro.fina_indicator(ts_code=codes_str, period=period, fields=fields)
+                if not df_chunk.empty:
+                    results.extend(df_chunk.to_dict(orient='records'))
+            except Exception as e:
+                # Log but continue
+                print(f"[!] Warn: Chunk {i} failed: {e}")
+                
+            time.sleep(0.5) # Rate limiting
+                
+        if not results:
+            return create_envelope([], status="empty", meta={"hint": f"No financial data found for {period}. Ensure date is valid quarter end."})
+            
+        return create_envelope(normalize_stock_records(results), status="success")
+    except Exception as e:
+        return create_envelope(None, status="error", error=f"Fetch financial indicator failed: {e}")
+
+

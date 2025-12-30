@@ -12,7 +12,8 @@ import google.generativeai as genai
 load_dotenv()
 
 # Configure GenAI
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+# Configure GenAI
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"), transport="rest")
 
 # Proxy Setup
 if os.getenv("HTTP_PROXY"):
@@ -56,12 +57,16 @@ class ErrorStep(Step):
 
 
 class CodeAgent:
-    def __init__(self, model_name: str = "gemini-2.0-pro-exp-02-05", tools: List[Any] = []):
+    def __init__(self, model_name: str = "gemini-3-flash-preview", tools: List[Any] = []):
         self.model_name = model_name
         self.tools = {tool.name: tool for tool in tools}
         print(f"DEBUG: Loaded tools: {list(self.tools.keys())}")
         self.memory: List[Step] = []
-        self.max_steps = 3  # Allow up to 3 attempts (Self-Correction)
+        self.max_steps = 15  # Allow up to 15 steps (Self-Correction)
+        
+        # Capture System/Env Proxy for isolation (Ping-Pong Strategy)
+        self.sys_http_proxy = os.getenv("HTTP_PROXY")
+        self.sys_https_proxy = os.getenv("HTTPS_PROXY")
 
     def _build_system_prompt(self) -> str:
         tool_descriptions = []
@@ -81,14 +86,64 @@ You have access to the following global functions. Please use these exact names:
 
 ### Instructions
 1. Answer the user's question by writing a Python code block (starts with ```python).
-2. **Use only the tools listed above.** Do not invent new function names (e.g. 'stock_price' does not exist).
-3. Use print() to output the answer.
-4. Pay attention to argument names in the signatures.
+2. **Use only the tools listed above.** Do not invent new function names.
 
-### Error Handling & Reflection
-- If your code fails with a `NameError` (e.g. 'stock_price' not defined), it means you used a wrong name.
-- **Action**: Check the "Available Tools" list above to find the correct name (e.g. `get_current_price`), then write the corrected code.
-"""
+### CRITICAL RULES (MUST FOLLOW)
+
+**Rule #1: ENVELOPE PROTOCOL (Rich Signals Pattern)**
+All tools now return a standard **Response Envelope** (Dict). You MUST parse it:
+```python
+res = tool_function(...)
+# Envelope Structure: {{'status': 'success'|'empty'|'error', 'data': ..., 'meta': {{'hint': ...}}}}
+
+if res['status'] == 'success':
+    data = res['data'] 
+    # Use data...
+elif res['status'] == 'empty':
+    # MUST read the hint. Do NOT retry blindly.
+    print(f"Empty: {{res['meta'].get('hint')}}")
+    # Example: If hint says "Try previous day", you MUST query yesterdays date immediately.
+elif res['status'] == 'error':
+    print(f"Error: {{res.get('error')}}")
+```
+**NEVER** assume the tool returns a list directly. ALWAYS check `status`.
+
+**Rule #2: NO GUESSING OF KEYS.** 
+If the user asks for financial indicators (PE, Dividend, etc.):
+- **MUST** call `search_knowledge(query)` first.
+- **Yield after search** (Action -> Observation -> Logic).
+
+
+
+**Rule #3: TERMINATION**
+- When you have successfully printed the final answer to the user, **STOP writing code**.
+- Output only a "Thought" summarizing the result.
+- If you continue writing code, the loop will never end.
+
+**Rule #4: DEFENSIVE CODING**
+- DO NOT assume the structure of `res['data']` (Dict vs List vs String).
+- **ALWAYS** inspect unfamiliar data first: `print(res['data'])` or `print(type(res['data']))`.
+- **NEVER** write `res['data']['key']` or `res['data'][0]` without verifying the structure first.
+- If `status` is 'success' but you are unsure of the schema, PRINT IT before accessing it.
+
+
+### One-Shot Example (Envelope Pattern)
+User: "Check Maotai's PE."
+Thought: Search keys first.
+Code:
+```python
+print(search_knowledge("PE key"))
+```
+Observation: Key is 'pe_ttm'.
+Thought: Fetch data and handle envelope.
+Code:
+```python
+res = get_fundamentals_data('600519.SH')
+if res['status'] == 'success':
+    print(f"PE: {{res['data']['pe_ttm']}}")
+else:
+    print(f"No data: {{res.get('meta')}}")
+```"""
 
     def _sanitize_history(self, history: List[str]) -> List[str]:
         """
@@ -167,7 +222,7 @@ You have access to the following global functions. Please use these exact names:
         return f"{system}{context_str}\n\nCurrent Task: {current_task}\n\nExisting Steps:\n{steps_str}\n\nYour Next Step (Write Python Code):"
 
 
-    def run(self, user_input: str, history: List[str] = [], stream_mode: str = "delta", session_id: str = None):
+    def run(self, user_input: str, history: List[str] = [], stream_mode: str = "delta", session_id: str = None, log_subdir: str = ""):
         full_buffer = ""
         
         def yield_content(chunk, replace=False):
@@ -185,7 +240,7 @@ You have access to the following global functions. Please use these exact names:
         if not session_id:
             session_id = f"session_{int(time.time())}"
             
-        log_dir = "logs"
+        log_dir = os.path.join("logs", log_subdir) if log_subdir else "logs"
         if not os.path.exists(log_dir):
             os.makedirs(log_dir)
             
@@ -214,116 +269,159 @@ You have access to the following global functions. Please use these exact names:
         
         yield yield_content(f"Thinking about '{user_input}'... (Attempt 1)\n")
 
-        while step_count < self.max_steps:
-            try:
-                prompt = self._build_prompt_from_memory(history)
-                
-                # Call LLM
-                llm_start = time.time()
-                model = genai.GenerativeModel(self.model_name)
-                # Safety settings omitted for brevity/compatibility (add back if needed)
-                response = model.generate_content(prompt)
-                llm_latency = time.time() - llm_start
-                
-                if not response.parts:
-                    err = "[!] Empty Response from Model."
-                    print(f"DEBUG: Empty Response. Prompt Feedback: {response.prompt_feedback if hasattr(response, 'prompt_feedback') else 'Unknown'}")
-                    yield yield_content(f"{err}\n")
-                    break # Stop if model broken
+
+        try:
+            while step_count < self.max_steps:
+                try:
+                    prompt = self._build_prompt_from_memory(history)
                     
-                content = response.text
-                self.memory.append(ThoughtStep(content))
-                
-                # Log Thought
-                log_entry["steps"].append({"type": "thought", "content": content, "latency": llm_latency, "attempt": step_count+1})
-                
-                # Display Thought
-                attempt_label = f"Attempt {step_count+1}"
-                thought_block = f"""
-<details>
+                    # Call LLM
+                    llm_start = time.time()
+                    # Restore System Proxy (Counter Tushare Pollution)
+                    if self.sys_http_proxy:
+                        os.environ["HTTP_PROXY"] = self.sys_http_proxy
+                    else:
+                        os.environ.pop("HTTP_PROXY", None)
+                        
+                    if self.sys_https_proxy:
+                        os.environ["HTTPS_PROXY"] = self.sys_https_proxy
+                    else:
+                        os.environ.pop("HTTPS_PROXY", None)
+
+                    if self.sys_https_proxy:
+                        os.environ["HTTPS_PROXY"] = self.sys_https_proxy
+                    else:
+                        os.environ.pop("HTTPS_PROXY", None)
+
+                    model = genai.GenerativeModel(self.model_name)
+                    # Safety settings omitted for brevity/compatibility
+                    response = model.generate_content(prompt)
+                    llm_latency = time.time() - llm_start
+                    
+                    if not response.parts:
+                        err = "[!] Empty Response from Model."
+                        print(f"DEBUG: Empty Response. Prompt Feedback: {response.prompt_feedback if hasattr(response, 'prompt_feedback') else 'Unknown'}")
+                        yield yield_content(f"{err}\n")
+                        break # Stop if model broken
+                        
+                    content = response.text
+                    self.memory.append(ThoughtStep(content))
+                    
+                    # Log Thought
+                    log_entry["steps"].append({"type": "thought", "content": content, "latency": llm_latency, "attempt": step_count+1})
+                    
+                    # Display Thought
+                    attempt_label = f"Step {step_count+1}"
+                    yield yield_content(f"\n--- {attempt_label} ---\n")
+                    
+                    thought_block = f"""
+<details open>
 <summary>🧠 Brain Trace ({attempt_label})</summary>
 {content}
 </details>
 """
-                yield yield_content(thought_block)
-                
-                # Extract Code
-                code_match = re.search(r"```python\n(.*?)```", content, re.DOTALL)
-                
-                if code_match:
-                    code = code_match.group(1)
-                    self.memory.append(CodeStep(code))
-                    log_entry["steps"].append({"type": "code", "content": code})
+                    yield yield_content(thought_block)
                     
-                    yield yield_content(f"\nrunning code ({attempt_label})... 🏃")
+                    # Extract Code
+                    code_match = re.search(r"```python\n(.*?)```", content, re.DOTALL)
                     
-                    # Execute Code
-                    exec_start = time.time()
-                    execution_result = ""
-                    execution_error = None
-                    
-                    # Generator-based code execution handling
-                    exec_gen = self._execute_code_generator(code)
-                    
-                    try:
-                        for chunk in exec_gen:
-                            # We might get strings (stdout) or Exceptions
-                            if isinstance(chunk, Exception):
-                                execution_error = chunk
-                            else:
-                                execution_result += chunk
-                                yield yield_content(f"\n{chunk}")
-                    except Exception as e:
-                        execution_error = e
+                    if code_match:
+                        code = code_match.group(1)
+                        self.memory.append(CodeStep(code))
+                        log_entry["steps"].append({"type": "code", "content": code})
+                        
+                        yield yield_content(f"\nrunning code ({attempt_label})... 🏃")
+                        
+                        # Execute Code
+                        exec_start = time.time()
+                        execution_result = ""
+                        execution_error = None
+                        
+                        # Generator-based code execution handling
+                        exec_gen = self._execute_code_generator(code)
+                        
+                        try:
+                            for chunk in exec_gen:
+                                # We might get strings (stdout) or Exceptions
+                                if isinstance(chunk, Exception):
+                                    execution_error = chunk
+                                else:
+                                    execution_result += chunk
+                                    yield yield_content(f"\n{chunk}")
+                        except Exception as e:
+                            execution_error = e
 
-                    exec_latency = time.time() - exec_start
+                        exec_latency = time.time() - exec_start
+                        
+                        # Store Observation or Error
+                        if execution_error:
+                            error_msg = str(execution_error)
+                            self.memory.append(ErrorStep(error_msg))
+                            log_entry["steps"].append({"type": "error", "content": error_msg, "latency": exec_latency})
+                            
+                            yield yield_content(f"\n⚠️ Execution Error in {attempt_label}: {error_msg}\nTrying to fix...\n")
+                            # Loop continues -> Next step will see ErrorStep
+                            
+                        else:
+                            # Success Logic
+                            self.memory.append(ObservationStep(execution_result))
+                            log_entry["steps"].append({"type": "execution_trace", "content": execution_result, "latency": exec_latency})
+                            
+                            # --- MIDDLEWARE: Observation Enrichment ---
+                            if self._is_suspicious_output(execution_result):
+                                warning_msg = "System Warning: Output contains 'None' or appears invalid. Please verify the data keys and try again."
+                                # Inject warning into memory for next turn
+                                self.memory.append(ObservationStep(warning_msg))
+                                # Yield warning to UI
+                                yield yield_content(f"\n⚠️ {warning_msg} (Self-Correction Triggered)\n")
+                            else:
+                                total_duration = time.time() - start_time
+                                summary = f"\n*(Success in {total_duration:.2f}s)*"
+                                yield yield_content(summary)
+                                
+                            # CRITICAL: DO NOT BREAK HERE.
+                            # The loop continues to let the Agent decide the next step based on the Observation.
+                            pass
                     
-                    # Store Observation or Error
-                    if execution_error:
-                        error_msg = str(execution_error)
-                        self.memory.append(ErrorStep(error_msg))
-                        log_entry["steps"].append({"type": "error", "content": error_msg, "latency": exec_latency})
-                        
-                        yield yield_content(f"\n⚠️ Execution Error in {attempt_label}: {error_msg}\nTrying to fix...\n")
-                        # Loop continues -> Next step will see ErrorStep
-                        
                     else:
-                        # Success!
-                        self.memory.append(ObservationStep(execution_result))
-                        log_entry["steps"].append({"type": "execution_trace", "content": execution_result, "latency": exec_latency})
-                        
-                        total_duration = time.time() - start_time
-                        summary = f"\n*(Success in {total_duration:.2f}s)*"
-                        yield yield_content(summary)
+                        # No code generated -> Pure Chat Response?
+                        # In ReAct, if no action is taken, it's usually the Final Answer.
+                        yield yield_content(f"\n(No code action. Assuming Final Answer.)\n")
                         final_success = True
-                        break # Break the loop on success
-                
-                else:
-                    # No code generated -> Pure Chat Response?
-                    # Consider this success if it's just an answer
-                    yield yield_content(f"\n(No code generated, assuming direct answer)\n")
-                    final_success = True
+                        break
+                        
+                except Exception as e:
+                    yield yield_content(f"\n[!] System Error: {e}\n")
                     break
                     
+                step_count += 1
+
+            if not final_success and step_count == self.max_steps:
+                 yield yield_content(f"\n[!] Failed to solve task after {self.max_steps} attempts or reached explicit Max Steps.\n")
+
+        finally:
+            # Save Log (This will now run even if GeneratorExit is triggered)
+            try:
+                 with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+                 print(f"DEBUG: Appended log to {log_file}")
             except Exception as e:
-                yield yield_content(f"\n[!] System Error: {e}\n")
-                break
-                
-            step_count += 1
+                print(f"DEBUG: Failed to write log: {e}")
 
-        if not final_success and step_count == self.max_steps:
-             yield yield_content(f"\n[!] Failed to solve task after {self.max_steps} attempts.\n")
-             
-        # Save Log
-        # Save Log (Append to Session JSONL)
-        # log_file was defined at start of run()
-        try:
-             with open(log_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
-             print(f"DEBUG: Appended log to {log_file}")
-        except Exception as e:
-            print(f"DEBUG: Failed to write log: {e}")
 
+
+    def _is_suspicious_output(self, output: str) -> bool:
+        """
+        Heuristic check: Return True if output seems to indicate failure despite no Exception.
+        """
+        # 1. Explicit 'None' in output (common Python null print)
+        # (Deleted 'None' check to prevent false positives with dictionaries)
+
+        # 2. Empty output (stripped of HTML tags)
+        clean_out = re.sub(r'<[^>]+>', '', output).strip()
+        if not clean_out: 
+             return True
+        return False
 
     # Helper to run code and yield output chunks
     def _execute_code_generator(self, code: str):

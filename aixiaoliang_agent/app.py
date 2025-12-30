@@ -9,6 +9,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from aixiaoliang_agent.agent.code_agent import CodeAgent
 from aixiaoliang_agent.tools.registry import default_registry
 import aixiaoliang_agent.tools.stock_data
+import aixiaoliang_agent.tools.knowledge_tool
 
 # Load env
 load_dotenv()
@@ -96,4 +97,29 @@ with gr.Blocks() as demo:
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=7860, share=False)
+    try:
+        # Load Env (Force reload if packaged)
+        load_dotenv()
+        
+        # FIX: Ensure localhost traffic bypasses the proxy
+        if "NO_PROXY" not in os.environ:
+            os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1"
+        
+        port = int(os.getenv("APP_PORT", 7860))
+        print(f"[*] Starting AiXiaoliang on port {port}...")
+        
+        demo.launch(
+            server_name="127.0.0.1", 
+            server_port=port, 
+            share=False
+        )
+    except Exception as e:
+        import traceback
+        print("\n" + "!"*50)
+        print("CRITICAL ERROR: Application failed to start.")
+        print(f"Error: {e}")
+        print("Details:")
+        traceback.print_exc()
+        print("!"*50 + "\n")
+        
+        input("Press Enter to exit...")
