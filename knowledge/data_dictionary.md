@@ -17,7 +17,7 @@
 #### 3. 代码示例 (Usage) - MUST READ
 ```python
 # 获取市盈率数据
-res = get_daily_basic(trade_date='20241220')
+res = get_daily_basic(trade_date='20251220')
 # 筛选逻辑需在 Agent 代码中实现
 
 ```
@@ -29,7 +29,7 @@ res = get_daily_basic(trade_date='20241220')
 `pb`
 #### 3. 代码示例 (Usage)
 ```python
-res = get_daily_basic(trade_date='20241220')
+res = get_daily_basic(trade_date='20251220')
 
 ```
 
@@ -44,7 +44,7 @@ res = get_daily_basic(trade_date='20241220')
 #### 3. 代码示例 (Usage)
 ```python
 # 获取股息率数据
-res = get_daily_basic(trade_date='20241220')
+res = get_daily_basic(trade_date='20251220')
 # Agent 遍历筛选 dv_ratio > 5 的股票
 
 ```
@@ -57,7 +57,7 @@ res = get_daily_basic(trade_date='20241220')
 *   滚动: `ps_ttm`
 #### 3. 代码示例 (Usage)
 ```python
-res = get_daily_basic(trade_date='20241220')
+res = get_daily_basic(trade_date='20251220')
 
 ```
 
@@ -70,7 +70,7 @@ res = get_daily_basic(trade_date='20241220')
 *   流通市值: `circ_mv`
 #### 3. 代码示例 (Usage)
 ```python
-res = get_daily_basic(trade_date='20241220')
+res = get_daily_basic(trade_date='20251220')
 # data = res['data']...
 
 ```
@@ -82,7 +82,7 @@ res = get_daily_basic(trade_date='20241220')
 `turnover_rate`
 #### 3. 代码示例 (Usage)
 ```python
-res = get_daily_basic(trade_date='20241220')
+res = get_daily_basic(trade_date='20251220')
 
 ```
 
@@ -132,10 +132,27 @@ amount = df['amount'] * 1000 # 换算成元
 *   净利率: `netprofit_margin`
 #### 3. 代码示例 (Usage)
 ```python
-# 获取盈利能力数据 (ROE, 毛利率)
+# 方法 A: 获取全市场某季度的盈利能力 (用于选股)
 res = get_financial_indicator(period='20240930')
-# 需使用季报截至日期
 
+# 方法 B: 获取特定股票的历史盈利能力 (用于杜邦分析)
+res = get_stock_financials(stock_code='600519.SH', limit=8)
+```
+
+### [指标卡片] 杜邦分析核心 (DuPont Components)
+#### 1. 业务定义
+将 ROE 拆解为三部分：
+*   **盈利能力**: 销售净利率 (`netprofit_margin`)
+*   **营运能力**: 总资产周转率 (`assets_turnover`)
+*   **财务杠杆**: 权益乘数 (`equity_multiplier`)
+*   **公式**: $ROE = 净利率 \times 周转率 \times 权益乘数$
+#### 2. 工具 (Tool)
+`get_stock_financials(stock_code='...', limit=8)`
+#### 3. 代码示例 (Usage)
+```python
+# 获取历史 8 个季度的杜邦指标
+res = get_stock_financials(stock_code='000001.SZ', limit=8)
+# data = res['data'] -> 遍历并计算 ROE 趋势和拆解项
 ```
 
 ### [指标卡片] 利润表核心 (Revenue/Profit TTM)
@@ -149,7 +166,7 @@ res = get_financial_indicator(period='20240930')
 #### 3. 代码示例 (Usage)
 ```python
 # 获取营收和净利润数据 (无需调用 get_income_statement)
-res = get_daily_basic(trade_date='20241220')
+res = get_daily_basic(trade_date='20251220')
 # data = res['data']
 # revenue = item['total_revenue_ttm']
 ```
@@ -216,8 +233,27 @@ stocks = get_concept_stocks(id='TS123')
 #### 4. 代码示例 (Usage)
 ```python
 # 获取某日全市场行情
-res = get_market_daily(trade_date='20241220')
+res = get_market_daily(trade_date='20251220')
 if res['status'] == 'success':
     df = pd.DataFrame(res['data'])
     # Agent 需自行根据业务规则编写筛选逻辑
+```
+
+---
+
+## 📂 七、 深度分析辅助 (Deep Analysis)
+
+### [指标卡片] 估值分位 (Valuation Percentile)
+#### 1. 业务定义
+计算当前 PE/PB 在过去一段时间（如 3 年）的百分位位置。
+*   **低位 (< 20%)**: 低估。
+*   **中位 (20% - 80%)**: 合理。
+*   **高位 (> 80%)**: 高估。
+#### 2. 工具 (Tool)
+`get_valuation_history(stock_code='...', start_date='...', end_date='...')`
+#### 3. 代码示例 (Usage)
+```python
+# 获取过去 3 年估值历史 (假设当前 20251220)
+res = get_valuation_history(stock_code='600519.SH', start_date='20221220', end_date='20251220')
+# 计算 pe_ttm 的分位数: (df['pe_ttm'] < current_pe).mean()
 ```

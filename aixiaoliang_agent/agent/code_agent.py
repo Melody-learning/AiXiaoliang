@@ -69,6 +69,9 @@ class CodeAgent:
         self.sys_https_proxy = os.getenv("HTTPS_PROXY")
 
     def _build_system_prompt(self) -> str:
+        import datetime
+        today = datetime.date.today().strftime("%Y-%m-%d")
+        
         tool_descriptions = []
         for name, tool in self.tools.items():
             import inspect
@@ -77,73 +80,42 @@ class CodeAgent:
         
         tool_desc_str = "\n".join(tool_descriptions)
         
-        return f"""You are a helpful assistant that can write Python code to answer questions.
+        return f"""You are '小亮' (AiXiaoliang), a professional financial analysis agent. 
+**Current Date: {today}**
+
+### 🎯 Core Mission: Efficiency First
+- **Provide direct, concise answers** for factual queries (e.g., stock price, search code).
+- **If you have the answer, STOP.** Do not perform additional code execution or deep analysis (DuPont/Valuation history) unless explicitly requested (e.g., using terms like "analysis", "diagnosis", "deep dive").
+- Avoid repeating the same data/facts multiple times in your responses.
 
 ### Available Tools
-You have access to the following global functions. Please use these exact names:
-
 {tool_desc_str}
 
-### Instructions
-1. Answer the user's question by writing a Python code block (starts with ```python).
-2. **Use only the tools listed above.** Do not invent new function names.
+### 🧠 Analysis Methodologies (Mental Models)
+Use these when in "Analysis Mode" (requested by user):
+1. **Value Persona**: PE/PB/Dividend history.
+2. **Growth Persona**: Revenue/Profit trends via `get_stock_financials`.
+3. **Technical Persona**: Moving averages and price charts.
 
-### CRITICAL RULES (MUST FOLLOW)
+### 📝 Structured Report Template (Mandatory for Analysis)
+If you are performing a deep analysis, follows this Markdown structure **ONLY in the final summary step**:
+---
+## 📊 [Stock Name/Code] 综合诊断报告
+**核心结论**: [一句精炼的判断]
+[... followed by Financial/Growth, Valuation, and Outlook sections ...]
+---
 
-**Rule #1: ENVELOPE PROTOCOL (Rich Signals Pattern)**
-All tools now return a standard **Response Envelope** (Dict). You MUST parse it:
-```python
-res = tool_function(...)
-# Envelope Structure: {{'status': 'success'|'empty'|'error', 'data': ..., 'meta': {{'hint': ...}}}}
+### CRITICAL RULES
+**Rule #2: NO GUESSING.** 
+Use `search_knowledge` for formulas/keys. Use `search_stock` for codes.
 
-if res['status'] == 'success':
-    data = res['data'] 
-    # Use data...
-elif res['status'] == 'empty':
-    # MUST read the hint. Do NOT retry blindly.
-    print(f"Empty: {{res['meta'].get('hint')}}")
-    # Example: If hint says "Try previous day", you MUST query yesterdays date immediately.
-elif res['status'] == 'error':
-    print(f"Error: {{res.get('error')}}")
-```
-**NEVER** assume the tool returns a list directly. ALWAYS check `status`.
+**Rule #3: PHASE-RESTRICTED REPORTING.**
+- **Thinking Phase (with code)**: Keep thoughts technical and brief. **DO NOT** output the full report template while writing code.
+- **Reporting Phase (Final Answer)**: You MUST output a clean summary starting with **`总结:`** or **`Final Answer:`**. This is where you use the Structured Report Template.
 
-**Rule #2: NO GUESSING OF KEYS.** 
-If the user asks for financial indicators (PE, Dividend, etc.):
-- **MUST** call `search_knowledge(query)` first.
-- **Yield after search** (Action -> Observation -> Logic).
-
-
-
-**Rule #3: TERMINATION**
-- When you have successfully printed the final answer to the user, **STOP writing code**.
-- Output only a "Thought" summarizing the result.
-- If you continue writing code, the loop will never end.
-
-**Rule #4: DEFENSIVE CODING**
-- DO NOT assume the structure of `res['data']` (Dict vs List vs String).
-- **ALWAYS** inspect unfamiliar data first: `print(res['data'])` or `print(type(res['data']))`.
-- **NEVER** write `res['data']['key']` or `res['data'][0]` without verifying the structure first.
-- If `status` is 'success' but you are unsure of the schema, PRINT IT before accessing it.
-
-
-### One-Shot Example (Envelope Pattern)
-User: "Check Maotai's PE."
-Thought: Search keys first.
-Code:
-```python
-print(search_knowledge("PE key"))
-```
-Observation: Key is 'pe_ttm'.
-Thought: Fetch data and handle envelope.
-Code:
-```python
-res = get_fundamentals_data('600519.SH')
-if res['status'] == 'success':
-    print(f"PE: {{res['data']['pe_ttm']}}")
-else:
-    print(f"No data: {{res.get('meta')}}")
-```"""
+**Rule #4: NO HTML TAGS.** 
+Do NOT use `<details>`, `<summary>`, or any other HTML tags. These are reserved for the system UI.
+"""
 
     def _sanitize_history(self, history: List[str]) -> List[str]:
         """
@@ -222,7 +194,9 @@ else:
         return f"{system}{context_str}\n\nCurrent Task: {current_task}\n\nExisting Steps:\n{steps_str}\n\nYour Next Step (Write Python Code):"
 
 
-    def run(self, user_input: str, history: List[str] = [], stream_mode: str = "delta", session_id: str = None, log_subdir: str = ""):
+    def run(self, user_input: str, history: Optional[List[str]] = None, stream_mode: str = "delta", session_id: str = None, log_subdir: str = ""):
+        if history is None:
+            history = []
         full_buffer = ""
         trace_md = "" # Aggregates all reasoning steps
         final_answer = ""
@@ -238,9 +212,14 @@ else:
         def render_display(is_final=False):
             """Helper to render the current trace + final answer"""
             status_attr = "" if is_final else "open"
-            accordion = f"<details {status_attr}>\n<summary>💡 思考过程 (点击展开)</summary>\n\n{trace_md}\n</details>"
+            accordion = f"<details {status_attr}>\n<summary>💡 思考过程 (后台解析中...)</summary>\n\n{trace_md}\n</details>"
             if is_final:
-                return f"{accordion}\n\n{final_answer}"
+                # Show final answer cleanly below the accordion
+                # Prefix it with a clear header if it doesn't already have one
+                display_text = final_answer
+                if not any(display_text.startswith(m) for m in ["总结:", "Final Answer:", "结论:", "回答:"]):
+                    display_text = f"#### 🏁 最终结论\n{display_text}"
+                return f"{accordion}\n\n{display_text}"
             return accordion
 
         # Reset Memory for this run
@@ -261,6 +240,13 @@ else:
             "query": user_input,
             "steps": []
         }
+        
+        def save_incremental_log():
+            try:
+                with open(log_file, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(log_entry, ensure_ascii=False, indent=2) + "\n")
+            except Exception as e:
+                print(f"DEBUG: Failed to write incremental log: {e}")
             
         start_time = time.time()
         step_count = 0
@@ -300,14 +286,22 @@ else:
                     content = response.text
                     self.memory.append(ThoughtStep(content))
                     log_entry["steps"].append({"type": "thought", "content": content, "latency": llm_latency, "attempt": step_count+1})
+                    save_incremental_log()
                     
                     # Extract Code
                     code_match = re.search(r"```python\n(.*?)```", content, re.DOTALL)
                     
                     if code_match:
-                        # If it has code, it's a reasoning step, add to trace
+                        # Clean LLM chatter to keep trace technical
+                        # 1. Remove manual "总结" or "Step" headers
+                        clean_content = re.sub(r'#### 🧠 Step \d+\n?', '', content, flags=re.MULTILINE)
+                        # 2. Remove any HTML tags the model might hallucinate
+                        clean_content = re.sub(r'<[^>]+>', '', clean_content)
+                        # 3. Aggressively strip "summaries" if they occur mid-trace to avoid double-reporting
+                        clean_content = re.sub(r'(总结|Final Answer|结论|回答):.*', '', clean_content, flags=re.IGNORECASE | re.DOTALL).strip()
+                        
                         attempt_label = f"Step {step_count+1}"
-                        trace_md += f"\n#### 🧠 {attempt_label}\n{content}\n"
+                        trace_md += f"\n#### 🧠 {attempt_label}\n{clean_content}\n"
                         trace_md += f"\n> 🏃 正在执行代码...\n"
                         yield yield_content(render_display(), replace=True)
                         
@@ -344,6 +338,7 @@ else:
                         else:
                             self.memory.append(ObservationStep(execution_result))
                             log_entry["steps"].append({"type": "execution_trace", "content": execution_result, "latency": exec_latency})
+                            save_incremental_log()
                             
                             if self._is_suspicious_output(execution_result):
                                 warning_msg = "System Warning: Output appears invalid. Self-Correction Triggered."
@@ -356,15 +351,26 @@ else:
                                 yield yield_content(render_display(), replace=True)
                     
                     else:
-                        # Final Answer Found (No code block)
-                        # Clean up "Thought: " or "Final Answer: " prefixes
-                        cleaned_answer = re.sub(r"^(Thought|Final Answer|总结|回答):\s*", "", content, flags=re.IGNORECASE | re.MULTILINE).strip()
-                        final_answer = cleaned_answer
+                        # Final Answer check
+                        # We look for the explicit marker to terminate
+                        marker_match = re.search(r"(总结|Final Answer|结论|回答):\s*(.*)", content, re.DOTALL | re.IGNORECASE)
                         
-                        # Add a final label to trace for completion
-                        trace_md += f"\n#### ✅ 任务完成\n{content}\n"
-                        final_success = True
-                        break
+                        if marker_match:
+                            final_answer = marker_match.group(0).strip()
+                            trace_md += f"\n#### ✅ 推理完成\n"
+                            final_success = True
+                            break
+                        elif step_count > 0:
+                            # Fallback: if it's not first turn and no code/marker, assume it's the end
+                            # but label it as such for debugging
+                            final_answer = content.strip()
+                            trace_md += f"\n#### ✅ 自动结案 (未发现显式标识)\n"
+                            final_success = True
+                            break
+                        else:
+                            # First turn chatter - keep it as thought
+                            trace_md += f"\n#### 💭 筹备思考\n{content}\n"
+                            yield yield_content(render_display(), replace=True)
                         
                 except Exception as e:
                     trace_md += f"\n[!] System Error: {e}\n"
@@ -380,13 +386,7 @@ else:
             yield yield_content(render_display(is_final=True), replace=True)
 
         finally:
-            # Save Log (This will now run even if GeneratorExit is triggered)
-            try:
-                 with open(log_file, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
-                 print(f"DEBUG: Appended log to {log_file}")
-            except Exception as e:
-                print(f"DEBUG: Failed to write log: {e}")
+            save_incremental_log() # Ensure final state is saved
 
 
 

@@ -80,13 +80,7 @@ def get_current_price(stock_code: str):
              return create_envelope(None, status="empty", meta={"hint": f"No price data for {stock_code}. Check if code is correct."})
         
         data = df.iloc[0]
-        # Return simple string as data? Or dict? Best to return structured data inside envelope.
-        # But text description in prompt says "returns latest daily close price" which implies value.
-        # Let's return text as data to minimize breaking change, or better, return a DICT.
-        # Let's return a string for now as the prompt might expect printed text.
-        # Actually returning a dict is better for future tools.
-        # Reverting to string to be safe with existing agent expectations if they print it directly, 
-        # BUT the envelope wrapper is a dict anyway. The AGENT CODE accesses `res['data']`.
+        # Return a simple description for the agent to use
         payload = f"{data['close']} (Date: {data['trade_date']})"
         return create_envelope(payload, status="success")
     except Exception as e:
@@ -353,3 +347,45 @@ def get_financial_indicator(period: str):
         return create_envelope(None, status="error", error=f"Fetch financial indicator failed: {e}")
 
 
+@register_tool(description="Get financial indicators for a SPECIFIC stock over multiple periods (DuPont analysis). Returns Envelope.")
+def get_stock_financials(stock_code: str, limit: int = 8):
+    """
+    Get ROE, Net Margin, Asset Turnover, and Equity Multiplier for a specific stock.
+    Useful for DuPont analysis. limit: number of periods (quarters).
+    """
+    try:
+        pro = ensure_tushare_init()
+        fields = 'ts_code,end_date,roe,netprofit_margin,gross_margin,assets_turnover,equity_multiplier,debt_to_assets'
+        df = pro.fina_indicator(ts_code=stock_code, limit=limit, fields=fields)
+        
+        if df.empty:
+            return create_envelope([], status="empty", meta={"hint": f"No financial indicators found for {stock_code}."})
+            
+        records = df.to_dict(orient='records')
+        return create_envelope(normalize_stock_records(records), status="success")
+    except Exception as e:
+        return create_envelope(None, status="error", error=f"Fetch stock financials failed: {e}")
+
+@register_tool(description="Get historical valuation indicators (PE, PB, PS) for a specific stock. Returns Envelope.")
+def get_valuation_history(stock_code: str, start_date: str, end_date: str):
+    """
+    Get historical PE, PB, PS, and Dividend Yield for a stock over a date range.
+    Useful for calculating valuation percentiles.
+    """
+    try:
+        pro = ensure_tushare_init()
+        # Clean dates
+        start_date = start_date.replace('-', '')
+        end_date = end_date.replace('-', '')
+        
+        fields = 'ts_code,trade_date,pe,pe_ttm,pb,ps,ps_ttm,dv_ratio,dv_ttm'
+        df = pro.daily_basic(ts_code=stock_code, start_date=start_date, end_date=end_date, fields=fields)
+        
+        if df.empty:
+            return create_envelope([], status="empty", meta={"hint": f"No valuation history for {stock_code} in this range."})
+            
+        df = df.sort_values('trade_date')
+        records = df.to_dict(orient='records')
+        return create_envelope(normalize_stock_records(records), status="success")
+    except Exception as e:
+        return create_envelope(None, status="error", error=f"Fetch valuation history failed: {e}")
